@@ -12,6 +12,8 @@ from ml_collections import ConfigDict
 from tqdm import tqdm, trange
 import numpy as np
 
+import datasets
+datasets.builder.has_sufficient_disk_space = lambda needed_bytes, directory='.': True
 from datasets import load_dataset
 
 
@@ -47,6 +49,61 @@ class DatasetFactory(object):
         raise ValueError('DatasetFactory is a static class and should not be instantiated.')
 
 
+IGNORE_INDEX = -100
+DEFAULT_PAD_TOKEN = "[PAD]"
+DEFAULT_EOS_TOKEN = "</s>"
+DEFAULT_BOS_TOKEN = "<s>"
+DEFAULT_UNK_TOKEN = "<unk>"
+PROMPT_DICT = {
+    "prompt_input": (
+        "Below is an instruction that describes a task, paired with an input that provides further context. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
+    ),
+    "prompt_no_input": (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request.\n\n"
+        "### Instruction:\n{instruction}\n\n### Response:"
+    ),
+}
+
+
+
+def _tokenize_fn(strings, tokenizer):
+    """Tokenize a list of strings."""
+    tokenized_list = [
+        tokenizer(
+            strings,
+            return_tensors="pt",
+            padding="longest",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        )
+    ]
+    input_ids = labels = [tokenized.input_ids[0] for tokenized in tokenized_list]
+    input_ids_lens = labels_lens = [
+        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
+    ]
+    return dict(
+        input_ids=input_ids,
+        labels=labels,
+        input_ids_lens=input_ids_lens,
+        labels_lens=labels_lens,
+    )
+
+
+def preprocess(
+        source,
+        target,
+        tokenizer,
+):
+    """Preprocess the data by tokenizing."""
+    example = source + target
+    examples_tokenized, sources_tokenized = [_tokenize_fn(string, tokenizer) for string in (example, source)]
+    input_ids = examples_tokenized["input_ids"][0]
+    loss_mask_tokens = [0] * sources_tokenized["input_ids_lens"][0] + [1] * (len(input_ids) - sources_tokenized["input_ids_lens"][0])
+    return input_ids, loss_mask_tokens
+
 class TextProcessor(object):
     """ Example processor that converts a dictionary of texts into tokens. """
 
@@ -59,18 +116,22 @@ class TextProcessor(object):
         config.add_bos_token = True
         config.add_eos_token = True
         config.prepend_text = ''
+        config.alpaca = False
         if updates is not None:
             config.update(ConfigDict(updates).copy_and_resolve_references())
         return config
 
     def __init__(self, config, tokenizer):
         self.config = self.get_default_config(config)
-        assert self.config.fields != '' or self.config.fields_from_example != '', (
-            'Either fields or fields_from_example must be specified.'
-        )
         self.tokenizer = tokenizer
+        if not self.config.alpaca:
+            assert self.config.fields != '' or self.config.fields_from_example != '', (
+                'Either fields or fields_from_example must be specified.'
+            )
+        else:
+            assert all([tokenizer.pad_token, tokenizer.eos_token, tokenizer.bos_token, tokenizer.unk_token])
 
-    def __call__(self, example, has_aux=False):
+    def default(self, example, has_aux=False):
         if has_aux:
             example, *aux = example
         else:
@@ -117,6 +178,29 @@ class TextProcessor(object):
             loss_mask_buffer.append(1.0)
 
         return token_buffer, loss_mask_buffer, *aux
+
+    def alpaca(self, example, has_aux):
+        if has_aux:
+            example, *aux = example
+        else:
+            aux = tuple()
+
+        prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
+        source = prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
+        # target = f"{example['output']}{self.tokenizer.eos_token}"
+        target = f"{example['output']}"
+
+        input_ids, loss_masks = preprocess(source, target, self.tokenizer)
+
+        return input_ids.tolist(), loss_masks, *aux
+
+
+    def __call__(self, example, has_aux=False):
+        if self.config.alpaca:
+            return self.alpaca(example, has_aux)
+        else:
+            return self.default(example, has_aux)
+
 
 
 class HuggingfaceDataset(object):

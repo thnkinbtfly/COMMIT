@@ -494,7 +494,7 @@ class LMClient(object):
         return log_likelihood, is_greedy
 
     def loglikelihood_rolling(self, text):
-        text = list(text)
+        text = [t[0] for t in text]
         if self.config.dummy:
             return [-1.0 for _ in text], [False for _ in text]
 
@@ -511,7 +511,7 @@ class LMClient(object):
         return log_likelihood, is_greedy
 
     def greedy_until(self, prefix, until):
-        prefix, until = list(prefix), list(until)
+        prefix, until = list(prefix), [u['until'] for u in until]
         if self.config.dummy:
             results = []
             for u in until:

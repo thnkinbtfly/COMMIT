@@ -18,6 +18,7 @@
 # by HuggingFace transformers.
 
 import gc
+import glob
 import json
 import math
 import os
@@ -287,8 +288,13 @@ def main(argv):
         tokenizer_path=FLAGS.output_dir,
         input_tokenizer_path=FLAGS.tokenizer_path,
     )
+    load_type, load_path = FLAGS.load_checkpoint.split("::")
+    ckpt = glob.glob(load_path)
+    print(ckpt)
+    assert len(ckpt) == 1
+    ckpt = f"{load_type}::{ckpt[0]}"
     write_model(
-        load_and_convert_checkpoint(FLAGS.load_checkpoint),
+        load_and_convert_checkpoint(ckpt),
         model_path=FLAGS.output_dir,
         model_size=FLAGS.model_size,
     )
