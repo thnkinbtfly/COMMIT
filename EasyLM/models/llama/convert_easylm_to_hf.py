@@ -42,6 +42,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     tokenizer_path='',
     model_size='13b',
     output_dir='',
+    vocab_size=32000,
 )
 
 
@@ -190,6 +191,7 @@ def write_model(loaded, model_path, model_size):
     write_json(index_dict, os.path.join(tmp_model_path, "pytorch_model.bin.index.json"))
 
     config = LlamaConfig(
+        vocab_size=FLAGS.vocab_size,
         hidden_size=dim,
         intermediate_size=params["intermediate_size"],
         num_attention_heads=params["n_heads"],

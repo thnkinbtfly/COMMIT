@@ -1,9 +1,11 @@
+import copy
 import dataclasses
 import pprint
 import time
 from functools import partial
 import json
 from multiprocessing import Pool
+import unicodedata
 
 import h5py
 import mlxu
@@ -12,9 +14,57 @@ from ml_collections import ConfigDict
 from tqdm import tqdm, trange
 import numpy as np
 
-import datasets
+import datasets, random
 datasets.builder.has_sufficient_disk_space = lambda needed_bytes, directory='.': True
 from datasets import load_dataset
+
+def _is_skip_target(char):
+    return _is_whitespace(char) or _is_punctuation(char)
+
+def _is_whitespace(char):
+    """Checks whether `chars` is a whitespace character."""
+    # \t, \n, and \r are technically contorl characters but we treat them
+    # as whitespace since they are generally considered as such.
+    if char == " " or char == "\t" or char == "\n" or char == "\r":
+        return True
+    cat = unicodedata.category(char)
+    if cat == "Zs":
+        return True
+    return False
+
+def _is_punctuation(char):
+    """Checks whether `chars` is a punctuation character."""
+    cp = ord(char)
+    # We treat all non-letter/number ASCII as punctuation.
+    # Characters such as "^", "$", and "`" are not in the Unicode
+    # Punctuation class but we treat them as punctuation anyways, for
+    # consistency.
+    if ((cp >= 33 and cp <= 47) or (cp >= 58 and cp <= 64) or
+            (cp >= 91 and cp <= 96) or (cp >= 123 and cp <= 126)):
+        return True
+    cat = unicodedata.category(char)
+    if cat.startswith("P"):
+        return True
+    return False
+
+def load_dict(dict_path, load_reverse=False):
+    lines = open(dict_path, 'r', encoding='utf-8').readlines()
+    src2tgt = {}
+    for line in lines:
+        line = line.strip()
+        try:
+            src, tgt = line.split("\t")
+        except:
+            src, tgt = line.split(" ")
+
+        if load_reverse:
+            src, tgt = tgt, src
+
+        if src not in src2tgt:
+            src2tgt[src] = [tgt]
+        else:
+            src2tgt[src].append(tgt)
+    return src2tgt
 
 
 class DatasetFactory(object):
@@ -68,7 +118,6 @@ PROMPT_DICT = {
 }
 
 
-
 def _tokenize_fn(strings, tokenizer):
     """Tokenize a list of strings."""
     tokenized_list = [
@@ -117,12 +166,20 @@ class TextProcessor(object):
         config.add_eos_token = True
         config.prepend_text = ''
         config.alpaca = False
+        config.codemix_dict_path = ''
+        config.codemix_ratio = 0.0
+        config.block_codemix_in_template = False
         if updates is not None:
             config.update(ConfigDict(updates).copy_and_resolve_references())
+
         return config
 
     def __init__(self, config, tokenizer):
         self.config = self.get_default_config(config)
+        if self.config.codemix_dict_path:
+            self.codemix_dict = load_dict(self.config.codemix_dict_path)
+            self.codemix_ratio = self.config.codemix_ratio
+            self.block_codemix_in_template = self.config.block_codemix_in_template
         self.tokenizer = tokenizer
         if not self.config.alpaca:
             assert self.config.fields != '' or self.config.fields_from_example != '', (
@@ -179,16 +236,54 @@ class TextProcessor(object):
 
         return token_buffer, loss_mask_buffer, *aux
 
+    def codemix_sentence(self, sent):
+        words = sent.split(' ')
+        codemixed_words = [self.codemix_word_considering_punct(w) for w in words]
+        return ' '.join(codemixed_words)
+
+    def codemix_word_considering_punct(self, w):
+        try:
+            start_i = 0
+            while _is_skip_target(w[start_i]):
+                start_i += 1
+
+            end_i = len(w) - 1
+            while _is_skip_target(w[end_i]):
+                end_i -= 1
+
+            codemix_target_word = w[start_i:end_i + 1]
+            codemixed_word = self.codemix_word(codemix_target_word)
+            return w[:start_i] + codemixed_word + w[end_i + 1:]
+        except: # all punct or blank
+            return w
+
+    def codemix_word(self, skip_removed_w):
+        if skip_removed_w in self.codemix_dict and random.random() < self.codemix_ratio:
+            return random.choice(self.codemix_dict[skip_removed_w])
+        else:
+            return skip_removed_w
+
+
     def alpaca(self, example, has_aux):
         if has_aux:
             example, *aux = example
         else:
             aux = tuple()
 
+        put_example = copy.deepcopy(example)
+        if self.config.codemix_dict_path and self.block_codemix_in_template:
+            put_example["instruction"] = self.codemix_sentence(put_example["instruction"])
+            if put_example.get("input", ""):
+                put_example["input"] = self.codemix_sentence(put_example["input"])
+
         prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
-        source = prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
-        # target = f"{example['output']}{self.tokenizer.eos_token}"
-        target = f"{example['output']}"
+        source = prompt_input.format_map(put_example) if put_example.get("input", "") != "" else prompt_no_input.format_map(put_example)
+        # target = f"{put_example['output']}{self.tokenizer.eos_token}"
+        if self.config.codemix_dict_path and not self.block_codemix_in_template:
+            source = self.codemix_sentence(source)
+        target = f"{put_example['output']}"
+        if self.config.codemix_dict_path:
+            target = self.codemix_sentence(target)
 
         input_ids, loss_masks = preprocess(source, target, self.tokenizer)
 
