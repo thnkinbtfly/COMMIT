@@ -40,6 +40,11 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     eval_steps=0,
     tokenizer=LLaMAConfig.get_tokenizer_config(),
     train_dataset=DatasetFactory.get_default_config(),
+    cmix_dataset=DatasetFactory.get_default_config(),
+    cmix_start_layer=0,
+    cmix_end_layer=5,
+    cmix_weight=1.0,
+    cmix_type='l2',
     eval_dataset=DatasetFactory.get_default_config(),
     optimizer=OptimizerFactory.get_default_config(),
     checkpointer=StreamingCheckpointer.get_default_config(),
@@ -65,6 +70,8 @@ def main(argv):
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
     if FLAGS.load_dataset_state != '':
         dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))
+
+    cmix_dataset = DatasetFactory.load_dataset(FLAGS.cmix_dataset, tokenizer)
 
     if FLAGS.eval_steps > 0:
         eval_dataset = DatasetFactory.load_dataset(
@@ -114,19 +121,48 @@ def main(argv):
     def train_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+
         def loss_and_accuracy(params):
             logits = model.apply(
                 params, batch['input_tokens'], deterministic=False,
                 rngs=rng_generator(llama_config.rng_keys()),
             ).logits
-            return cross_entropy_loss_and_accuracy(
+
+            orig_hidden_states = model.apply(params, batch['orig_tokens'], deterministic=False,
+                                      rngs=rng_generator(llama_config.rng_keys()),
+                                      output_hidden_states=True,
+                                      ).hidden_states
+            cmix_hidden_states = model.apply(params, batch['codemixed_tokens'], deterministic=False,
+                                        rngs=rng_generator(llama_config.rng_keys()),
+                                        output_hidden_states=True,
+                                        ).hidden_states
+            cmix_loss = 0
+            for i in range(FLAGS.cmix_start_layer, FLAGS.cmix_end_layer + 1):
+                if FLAGS.cmix_type == 'l2':
+                    cmix_loss += jnp.sqrt(jnp.mean(jnp.square(orig_hidden_states[i] - cmix_hidden_states[i])))
+                elif FLAGS.cmix_type == 'avgdist':
+                    cmix_loss += jnp.sqrt(jnp.mean(jnp.square(jnp.mean(orig_hidden_states[i], axis=(0, 1)) - jnp.mean(cmix_hidden_states[i], axis=(0, 1)))))
+                elif FLAGS.cmix_type == 'cos':
+                    orig_sents = jnp.mean(orig_hidden_states[i], axis=1)
+                    cmix_sents = jnp.mean(cmix_hidden_states[i], axis=1)
+                    cmix_loss -= jnp.mean(jnp.dot(orig_sents, cmix_sents) / (
+                                jnp.linalg.norm(orig_sents, axis=1) * jnp.linalg.norm(cmix_sents, axis=1)))
+                # elif FLAGS.cmix_type == 'cka':
+                #     cmix_loss -= jnp.dot(orig_hidden_states[i], cmix_hidden_states[i])
+
+            loss, accuracy = cross_entropy_loss_and_accuracy(
                 logits, batch['target_tokens'], batch['loss_masks']
             )
+            return loss + FLAGS.cmix_weight * cmix_loss, (accuracy, loss, cmix_loss)
+
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
-        (loss, accuracy), grads = grad_fn(train_state.params)
+        (loss, aux), grads = grad_fn(train_state.params)
+        accuracy, ce_loss, cmix_loss = aux
         train_state = train_state.apply_gradients(grads=grads)
         metrics = dict(
             loss=loss,
+            ce_loss=ce_loss,
+            cmix_loss=cmix_loss,
             accuracy=accuracy,
             learning_rate=optimizer_info['learning_rate_schedule'](train_state.step),
             gradient_norm=global_norm(grads),
@@ -231,22 +267,13 @@ def main(argv):
 
         step_counter = trange(start_step, FLAGS.total_steps, ncols=0)
 
-        for step, (batch, dataset_metrics) in zip(step_counter, dataset):
+        for step, (batch, dataset_metrics), (cmix_batch, cmix_metrics) in zip(step_counter, dataset, cmix_dataset):
+            batch.update(cmix_batch)
             train_state, sharded_rng, metrics = sharded_train_step(
                 train_state, sharded_rng, batch
             )
 
             if step % FLAGS.log_freq == 0:
-                if FLAGS.eval_steps > 0:
-                    eval_metric_list = []
-                    for _ in range(FLAGS.eval_steps):
-                        eval_batch, _ = next(eval_iterator)
-                        sharded_rng, eval_metrics = sharded_eval_step(
-                            train_state, sharded_rng, eval_batch
-                        )
-                        eval_metric_list.append(eval_metrics)
-                    metrics.update(average_metrics(eval_metric_list))
-
                 log_metrics = {"step": step}
                 log_metrics.update(metrics)
                 log_metrics.update(dataset_metrics)

@@ -15,11 +15,14 @@ from tqdm import tqdm, trange
 import numpy as np
 
 import datasets, random
+
 datasets.builder.has_sufficient_disk_space = lambda needed_bytes, directory='.': True
 from datasets import load_dataset
 
+
 def _is_skip_target(char):
     return _is_whitespace(char) or _is_punctuation(char)
+
 
 def _is_whitespace(char):
     """Checks whether `chars` is a whitespace character."""
@@ -31,6 +34,7 @@ def _is_whitespace(char):
     if cat == "Zs":
         return True
     return False
+
 
 def _is_punctuation(char):
     """Checks whether `chars` is a punctuation character."""
@@ -46,6 +50,7 @@ def _is_punctuation(char):
     if cat.startswith("P"):
         return True
     return False
+
 
 def load_dict(dict_path, load_reverse=False):
     lines = open(dict_path, 'r', encoding='utf-8').readlines()
@@ -75,8 +80,10 @@ class DatasetFactory(object):
         config = ConfigDict()
         config.type = 'huggingface'
         config.text_processor = TextProcessor.get_default_config()
+        config.codemix_processor = CodeMixProcessor.get_default_config()
         config.huggingface_dataset = HuggingfaceDataset.get_default_config()
         config.json_dataset = JsonDataset.get_default_config()
+        config.cljson_dataset = CLJsonDataset.get_default_config()
 
         if updates is not None:
             config.update(ConfigDict(updates).copy_and_resolve_references())
@@ -85,6 +92,9 @@ class DatasetFactory(object):
     @classmethod
     def load_dataset(cls, config, tokenizer, **kwargs):
         config = cls.get_default_config(config)
+        if config.type == 'cljson':
+            text_processor = CodeMixProcessor(config.codemix_processor, tokenizer)
+            return CLJsonDataset(config.cljson_dataset, tokenizer, text_processor, **kwargs)
         text_processor = TextProcessor(config.text_processor, tokenizer)
         if config.type == 'huggingface':
             return HuggingfaceDataset(
@@ -152,6 +162,83 @@ def preprocess(
     input_ids = examples_tokenized["input_ids"][0]
     loss_mask_tokens = [0] * sources_tokenized["input_ids_lens"][0] + [1] * (len(input_ids) - sources_tokenized["input_ids_lens"][0])
     return input_ids, loss_mask_tokens
+
+
+class CodeMixProcessor(object):
+    @staticmethod
+    def get_default_config(updates=None):
+        config = ConfigDict()
+        config.codemix_dict_path = ''
+        if updates is not None:
+            config.update(ConfigDict(updates).copy_and_resolve_references())
+
+        return config
+
+    def __init__(self, config, tokenizer):
+        self.config = self.get_default_config(config)
+        self.codemix_dict = load_dict(self.config.codemix_dict_path)
+        self.block_codemix_in_template = True
+        self.tokenizer = tokenizer
+        self.codemix_ratio = 1.0
+
+    def codemix_sentence(self, sent):
+        words = sent.split(' ')
+        codemixed_words = [self.codemix_word_considering_punct(w) for w in words]
+        return ' '.join(codemixed_words)
+
+    def codemix_word_considering_punct(self, w):
+        try:
+            start_i = 0
+            while _is_skip_target(w[start_i]):
+                start_i += 1
+
+            end_i = len(w) - 1
+            while _is_skip_target(w[end_i]):
+                end_i -= 1
+
+            codemix_target_word = w[start_i:end_i + 1]
+            codemixed_word = self.codemix_word(codemix_target_word)
+            return w[:start_i] + codemixed_word + w[end_i + 1:]
+        except:  # all punct or blank
+            return w
+
+    def codemix_word(self, skip_removed_w):
+        if skip_removed_w in self.codemix_dict and random.random() < self.codemix_ratio:
+            return random.choice(self.codemix_dict[skip_removed_w])
+        else:
+            return skip_removed_w
+
+    def __call__(self, example, has_aux=False):
+        if has_aux:
+            example, *aux = example
+        else:
+            aux = tuple()
+
+        prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
+        source = prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
+        # target = f"{example['output']}{self.tokenizer.eos_token}"
+        target = f"{example['output']}"
+
+        orig_tokens = _tokenize_fn(source + target, self.tokenizer)['input_ids'][0]
+
+        put_example = copy.deepcopy(example)
+        if self.config.codemix_dict_path and self.block_codemix_in_template:
+            put_example["instruction"] = self.codemix_sentence(put_example["instruction"])
+            if put_example.get("input", ""):
+                put_example["input"] = self.codemix_sentence(put_example["input"])
+
+        source = prompt_input.format_map(put_example) if put_example.get("input", "") != "" else prompt_no_input.format_map(put_example)
+        # target = f"{put_example['output']}{self.tokenizer.eos_token}"
+        if self.config.codemix_dict_path and not self.block_codemix_in_template:
+            source = self.codemix_sentence(source)
+        target = f"{put_example['output']}"
+        if self.config.codemix_dict_path:
+            target = self.codemix_sentence(target)
+
+        codemixed_tokens = _tokenize_fn(source + target, self.tokenizer)['input_ids'][0]
+
+        return orig_tokens.tolist(), codemixed_tokens.tolist(), *aux
+
 
 class TextProcessor(object):
     """ Example processor that converts a dictionary of texts into tokens. """
@@ -254,7 +341,7 @@ class TextProcessor(object):
             codemix_target_word = w[start_i:end_i + 1]
             codemixed_word = self.codemix_word(codemix_target_word)
             return w[:start_i] + codemixed_word + w[end_i + 1:]
-        except: # all punct or blank
+        except:  # all punct or blank
             return w
 
     def codemix_word(self, skip_removed_w):
@@ -262,7 +349,6 @@ class TextProcessor(object):
             return random.choice(self.codemix_dict[skip_removed_w])
         else:
             return skip_removed_w
-
 
     def alpaca(self, example, has_aux):
         if has_aux:
@@ -289,13 +375,11 @@ class TextProcessor(object):
 
         return input_ids.tolist(), loss_masks, *aux
 
-
     def __call__(self, example, has_aux=False):
         if self.config.alpaca:
             return self.alpaca(example, has_aux)
         else:
             return self.default(example, has_aux)
-
 
 
 class HuggingfaceDataset(object):
@@ -438,7 +522,7 @@ class JsonDataset(object):
             while True:
                 line = fin.readline()
                 self._file_loc = fin.tell()
-                if not line:   # Reached EOF
+                if not line:  # Reached EOF
                     self._index = 0
                     fin.seek(0)
                     continue
@@ -502,7 +586,7 @@ class JsonDataset(object):
                     step_times = step_times[-self.config.throughput_average_window_size:]
                 average_throughput = chunk_size / np.mean(step_times)
                 accumulated_throughput = (
-                    (self._total_tokens - start_tokens) / (time.time() - start_time)
+                        (self._total_tokens - start_tokens) / (time.time() - start_time)
                 )
                 metrics = {
                     'dataset_file_loc': loc,
@@ -558,3 +642,41 @@ class JsonDataset(object):
     @property
     def vocab_size(self):
         return len(self.tokenizer)
+
+
+class CLJsonDataset(JsonDataset):
+    def __iter__(self):
+        total_tokens = []
+        total_codemixed_tokens = []
+        cur_tokens = []
+        cur_codemixed_tokens = []
+
+        for tokens, codemixed_tokens, loc, index in self.parallel_example_iterator():
+            if len(cur_tokens) + len(tokens) < self.config.seq_length and len(cur_codemixed_tokens) + len(codemixed_tokens) < self.config.seq_length:
+                cur_tokens.extend(tokens)
+                cur_codemixed_tokens.extend(codemixed_tokens)
+            else:
+                cur_tokens.extend([self.tokenizer.pad_token_id for _ in range(self.config.seq_length - len(cur_tokens))])
+                cur_codemixed_tokens.extend([self.tokenizer.pad_token_id for _ in range(self.config.seq_length - len(cur_codemixed_tokens))])
+
+                total_tokens.append(cur_tokens)
+                total_codemixed_tokens.append(cur_codemixed_tokens)
+                cur_tokens = tokens[:self.config.seq_length]
+                cur_codemixed_tokens = codemixed_tokens[:self.config.seq_length]
+
+                if len(cur_tokens) >= self.config.batch_size:
+                    metrics = {
+                        'dataset_file_loc': loc,
+                        'dataset_example_index': index,
+                    }
+                    batch = {
+                        'orig_tokens': np.array(total_tokens, dtype=np.int32).reshape(
+                            self.config.batch_size, -1
+                        ),
+                        'codemixed_tokens': np.array(total_codemixed_tokens, dtype=np.int32).reshape(
+                            self.config.batch_size, -1
+                        ),
+                    }
+                    yield batch, metrics
+                    total_tokens = []
+                    total_codemixed_tokens = []
