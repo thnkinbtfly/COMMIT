@@ -1,92 +1,58 @@
-# EasyLM
-Large language models (LLMs) made easy, EasyLM is a one stop solution for
-pre-training, finetuning, evaluating and serving LLMs in JAX/Flax. EasyLM can
-scale up LLM training to hundreds of TPU/GPU accelerators by leveraging
-JAX's pjit functionality.
+# COMMIT: Code-Mixing English-Centric Large Language Model for Multilingual Instruction Tuning
 
+Implemented based on [EasyLM](https://github.com/young-geng/EasyLM) and [lm-evaluation-harness](https://github.com/OpenGPTX/lm-evaluation-harness).
 
-Building on top of Hugginface's [transformers](https://huggingface.co/docs/transformers/main/en/index)
-and [datasets](https://huggingface.co/docs/datasets/index), this repo provides
-an easy to use and easy to customize codebase for training large language models
-without the complexity in many other frameworks.
+## Specialized Code-mixing for Instruction Tuning 
+First, prepare the weight of LLaMA by following [EasyLM doc](docs/llama.md), and download the [MUSE](https://github.com/facebookresearch/MUSE) dictionary to `dicts`.
 
+Then perform COMMIT on TPUv3-8 and convert to hf format as follows:
+```bash
+export save_path=SAVE_PATH
+export lang=hi # or el, th
+python -m EasyLM.models.llama.llama_train \
+--mesh_dim=1,1,-1 \
+--load_llama_config=7b \
+--load_checkpoint=params::7B \
+--total_steps=1210 \
+--logger.output_dir=$save_path \
+--save_milestone_freq=1210 \
+--tokenizer.vocab_file=tokenizer.model \
+--tokenizer.add_bos_token=True \
+--tokenizer.add_eos_token=True \
+--optimizer.type=adamw \
+--optimizer.accumulate_gradient_steps=1 \
+--optimizer.adamw_optimizer.weight_decay=0.0 \
+--optimizer.adamw_optimizer.lr=2e-5 \
+--optimizer.adamw_optimizer.b1=0.9 \
+--optimizer.adamw_optimizer.b2=0.999 \
+--optimizer.adamw_optimizer.end_lr=1e-7 \
+--optimizer.adamw_optimizer.lr_warmup_steps=36 \
+--optimizer.adamw_optimizer.lr_decay_steps=1210 \
+--optimizer.adamw_optimizer.bf16_momentum=True \
+--train_dataset.text_processor.alpaca=True \
+--train_dataset.text_processor.codemix_dict_path=dicts/en-${lang}.txt \
+--train_dataset.text_processor.codemix_ratio=0.9 \
+--train_dataset.text_processor.block_codemix_in_template=True \
+--train_dataset.type=huggingface \
+--train_dataset.huggingface_dataset.path=tatsu-lab/alpaca \
+--train_dataset.huggingface_dataset.seq_length=512 \
+--train_dataset.huggingface_dataset.batch_size=16 \
+--update_llama_config='{"resid_pdrop": 0.05, "embd_pdrop": 0.05, "attn_pdrop": 0.05, "fcm_max_ratio": 0.1}' --log_freq=5000
 
-EasyLM is built with JAX/Flax. By leveraging JAX's pjit utility, EasyLM is able
-to train large models that don't fit on a single accelerator by sharding
-the model weights and training data across multiple accelerators. Currently,
-EasyLM supports multiple TPU/GPU training in a single host as well as multi-host
-training on Google Cloud TPU Pods.
-
-Currently, the following models are supported:
-* [LLaMA](https://arxiv.org/abs/2302.13971)
-* [GPT-J](https://huggingface.co/EleutherAI/gpt-j-6B)
-* [RoBERTa](https://huggingface.co/docs/transformers/model_doc/roberta)
-
-## Discord Server
-We are running an unofficial Discord community (unaffiliated with Google) for discussion related to training LLMs in JAX. [Follow this link to join the Discord server](https://discord.gg/Rf4drG3Bhp). We have dedicated channels for several JAX based LLM frameworks, include EasyLM, [JaxSeq](https://github.com/Sea-Snell/JAXSeq), [Alpa](https://github.com/alpa-projects/alpa) and [Levanter](https://github.com/stanford-crfm/levanter).
-
-
-## Models Trained with EasyLM
-### OpenLLaMA
-OpenLLaMA is our permissively licensed reproduction of LLaMA which can be used
-for commercial purposes. Check out the [project main page here](https://github.com/openlm-research/open_llama).
-The OpenLLaMA can serve as drop in replacement for the LLaMA weights in EasyLM.
-Please refer to the [LLaMA documentation](docs/llama.md) for more details.
-
-
-### Koala
-Koala is our new chatbot fine-tuned on top of LLaMA. If you are interested in
-our Koala chatbot, you can check out the [blogpost](https://bair.berkeley.edu/blog/2023/04/03/koala/)
-and [documentation for running it locally](docs/koala.md).
-
-
-## Installation
-The installation method differs between GPU hosts and Cloud TPU hosts. The first
-step is to pull from GitHub.
-
-``` shell
-git clone https://github.com/young-geng/EasyLM.git
-cd EasyLM
-export PYTHONPATH="${PWD}:$PYTHONPATH"
+export hf_save_dir=HF_SAVE_DIR
+python -m EasyLM.models.llama.convert_easylm_to_hf \
+--load_checkpoint=params::$save_path/*/streaming_params_1210 \
+--tokenizer_path=tokenizer.model \
+--model_size='7b' \
+--output_dir=$hf_save_dir
 ```
 
-#### Installing on GPU Host
-The GPU environment can be installed via [Anaconda](https://www.anaconda.com/products/distribution).
+Finally, run evaluation on GPU
+```bash
+python main.py \
+--model hf-causal-experimental \
+--model_args pretrained=$hf_save_dir --batch_size=2 \
+--tasks ogx_xquad_${lang} --output_path $hf_save_dir/result.json \
+--device cuda
 
-``` shell
-conda env create -f scripts/gpu_environment.yml
-conda activate EasyLM
 ```
-
-#### Installing on Cloud TPU Host
-The TPU host VM comes with Python and PIP pre-installed. Simply run the following
-script to set up the TPU host.
-
-``` shell
-./scripts/tpu_vm_setup.sh
-```
-
-
-## [Documentations](docs/README.md)
-The EasyLM documentations can be found in the [docs](docs/) directory.
-
-
-## Reference
-If you found EasyLM useful in your research or applications, please cite using the following BibTeX:
-```
-@software{geng2023easylm,
-  author = {Geng, Xinyang},
-  title = {EasyLM: A Simple And Scalable Training Framework for Large Language Models},
-  month = March,
-  year = 2023,
-  url = {https://github.com/young-geng/EasyLM}
-}
-```
-
-
-
-## Credits
-* The LLaMA implementation is from [JAX_llama](https://github.com/Sea-Snell/JAX_llama)
-* The JAX/Flax GPT-J and RoBERTa implementation are from [transformers](https://huggingface.co/docs/transformers/main/en/index)
-* Most of the JAX utilities are from [mlxu](https://github.com/young-geng/mlxu)
-* The codebase is heavily inspired by [JAXSeq](https://github.com/Sea-Snell/JAXSeq)
