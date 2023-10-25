@@ -54,7 +54,7 @@ Notes
 
 Finally, run evaluation on GPU
 ```bash
-python main.py \
+python lm-evaluation-harness/main.py \
 --model hf-causal-experimental \
 --model_args pretrained=$hf_save_dir --batch_size=2 \
 --tasks ogx_xquad_${lang} --output_path $hf_save_dir/result.json \
