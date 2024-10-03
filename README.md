@@ -1,4 +1,4 @@
-# COMMIT: Code-Mixing English-Centric Large Language Model for Multilingual Instruction Tuning
+# [NAACL 2024 Findings] COMMIT: Code-Mixing English-Centric Large Language Model for Multilingual Instruction Tuning
 
 Implemented based on [EasyLM](https://github.com/young-geng/EasyLM) and [lm-evaluation-harness](https://github.com/OpenGPTX/lm-evaluation-harness).
 
